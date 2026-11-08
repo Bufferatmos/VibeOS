@@ -445,6 +445,27 @@ static void run(char *line) {
                 }
             }
         }
+    } else if (!strcmp(line, "cat")) {
+        if (!ramfs_name_valid(arg)) {
+            puts("usage: cat <name>\n");
+        } else {
+            struct ramfs_entry *file = ramfs_find(arg);
+            if (!file) puts("No such file: "); 
+            if (!file) { puts(arg); putc('\n'); }
+            else { puts(file->data); putc('\n'); }
+        }
+    } else if (!strcmp(line, "rm")) {
+        if (!ramfs_name_valid(arg)) {
+            puts("usage: rm <name>\n");
+        } else {
+            struct ramfs_entry *file = ramfs_find(arg);
+            if (!file) {
+                puts("No such file: "); puts(arg); putc('\n');
+            } else {
+                puts("Deleted "); puts(file->name); putc('\n');
+                memset(file, 0, sizeof(*file));
+            }
+        }
     } else if (!strcmp(line, "about")) {
         puts("VibeOS 0.2 - a hobby kernel, vibe-coded.\n32-bit x86, VGA text, PS/2 keyboard, PIT timer, RAM files.\n");
     } else if (!strcmp(line, "uptime")) {
@@ -521,7 +542,7 @@ void kmain(uint32_t magic, struct mb_info *info) {
     __asm__ volatile("sti");
 
     banner();
-    char line[128];
+    char line[256];
     for (;;) {
         set_color(10, 0); puts("vibe"); set_color(7, 0); puts("@os"); set_color(15, 0); puts("> ");
         readline(line, sizeof(line));
