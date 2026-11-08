@@ -450,9 +450,11 @@ static void run(char *line) {
             puts("usage: cat <name>\n");
         } else {
             struct ramfs_entry *file = ramfs_find(arg);
-            if (!file) puts("No such file: "); 
-            if (!file) { puts(arg); putc('\n'); }
-            else { puts(file->data); putc('\n'); }
+            if (!file) {
+                puts("No such file: "); puts(arg); putc('\n');
+            } else {
+                puts(file->data); putc('\n');
+            }
         }
     } else if (!strcmp(line, "rm")) {
         if (!ramfs_name_valid(arg)) {
