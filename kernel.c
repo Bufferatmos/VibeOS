@@ -170,6 +170,11 @@ void exc_handler(uint32_t vec) {
 /* ------------------------------------------------------------------ */
 /* Keyboard (PS/2, scancode set 1)                                     */
 /* ------------------------------------------------------------------ */
+#define KEY_UP    0x11
+#define KEY_DOWN  0x12
+#define KEY_LEFT  0x13
+#define KEY_RIGHT 0x14
+
 static uint8_t km_normal[128], km_shift[128];
 static int keymap_is_azerty;
 
@@ -224,7 +229,16 @@ static void keyboard_irq(void) {
     uint8_t sc = inb(0x60);
     if (sc == 0xE0) { ext = 1; return; }
     int release = sc & 0x80; sc &= 0x7F;
-    if (ext) { ext = 0; return; }
+    if (ext) {
+        ext = 0;
+        if (!release) {
+            if (sc == 0x48) kb_push(KEY_UP);
+            else if (sc == 0x50) kb_push(KEY_DOWN);
+            else if (sc == 0x4B) kb_push(KEY_LEFT);
+            else if (sc == 0x4D) kb_push(KEY_RIGHT);
+        }
+        return;
+    }
     if (sc == 0x2A || sc == 0x36) { shift = !release; return; }
     if (release) return;
     if (sc == 0x3A) { caps = !caps; return; }
@@ -239,6 +253,21 @@ void irq_handler(uint32_t vec) {
         /* poll serial so the shell also works from the terminal */
         while (serial_has_data()) {
             char c = (char)inb(COM1);
+            if (c == 0x1B && serial_has_data()) {
+                char c2 = (char)inb(COM1);
+                if (c2 == '[') {
+                    int spin = 100000;
+                    while (!serial_has_data() && --spin) {}
+                    char c3 = serial_has_data() ? (char)inb(COM1) : 0;
+                    if (c3 == 'A') kb_push(KEY_UP);
+                    else if (c3 == 'B') kb_push(KEY_DOWN);
+                    else if (c3 == 'C') kb_push(KEY_RIGHT);
+                    else if (c3 == 'D') kb_push(KEY_LEFT);
+                    continue;
+                }
+                kb_push(0x1B);
+                c = c2;
+            }
             if (c == '\r') c = '\n';
             if (c == 0x7F) c = '\b';
             kb_push(c);
@@ -354,6 +383,268 @@ static int parse_int(const char *s, int *out) {
 
 static void sleep_ticks(uint32_t t) { uint32_t end = ticks + t; while (ticks < end) __asm__ volatile("hlt"); }
 
+/* ------------------------------------------------------------------ */
+/* Text-mode UI ("desktop"): windows, file manager, tiny editor        */
+/* ------------------------------------------------------------------ */
+#define A_DESK  0x19   /* light blue on blue (desktop pattern) */
+#define A_BAR   0x70   /* black on grey */
+#define A_WIN   0x70
+#define A_BORD  0x7F   /* white on grey */
+#define A_TITLE 0x1F   /* white on blue */
+#define A_SEL   0x1F
+#define A_DIM   0x78   /* dark grey on grey */
+#define A_ERR   0x74   /* red on grey */
+#define UI_ROWS 10     /* visible rows in the file list */
+
+static void cpu_vendor(char *v) {
+    uint32_t b, c, d, dummy;
+    __asm__ volatile("cpuid" : "=a"(dummy), "=b"(b), "=c"(c), "=d"(d) : "a"(0));
+    memcpy(v, &b, 4); memcpy(v + 4, &d, 4); memcpy(v + 8, &c, 4); v[12] = 0;
+}
+
+static int fmt_u(char *o, uint32_t n) {
+    char t[11]; int i = 0, k = 0;
+    if (!n) t[i++] = '0';
+    while (n) { t[i++] = (char)('0' + n % 10); n /= 10; }
+    while (i) o[k++] = t[--i];
+    o[k] = 0;
+    return k;
+}
+static void fmt2(char *o, uint32_t v) { o[0] = (char)('0' + (v / 10) % 10); o[1] = (char)('0' + v % 10); o[2] = 0; }
+static void str_cat(char *d, const char *s) { while (*d) d++; while ((*d++ = *s++)) {} }
+static void cat_u(char *d, uint32_t n) { char t[12]; fmt_u(t, n); str_cat(d, t); }
+
+static void ui_cell(int x, int y, uint8_t ch, uint8_t at) {
+    if (x < 0 || x >= VGA_W || y < 0 || y >= VGA_H) return;
+    VGA[y * VGA_W + x] = (uint16_t)((at << 8) | ch);
+}
+static void ui_fill(int x, int y, int w, int h, uint8_t ch, uint8_t at) {
+    for (int j = 0; j < h; j++) for (int i = 0; i < w; i++) ui_cell(x + i, y + j, ch, at);
+}
+static void ui_text(int x, int y, const char *s, int maxw, uint8_t at) {
+    for (int i = 0; s[i] && (maxw < 0 || i < maxw); i++) ui_cell(x + i, y, (uint8_t)s[i], at);
+}
+
+/* window with a double-line border (CP437 box characters) and a title */
+static void ui_box(int x, int y, int w, int h, const char *title) {
+    ui_fill(x, y, w, h, ' ', A_WIN);
+    ui_cell(x, y, 0xC9, A_BORD);          ui_cell(x + w - 1, y, 0xBB, A_BORD);
+    ui_cell(x, y + h - 1, 0xC8, A_BORD);  ui_cell(x + w - 1, y + h - 1, 0xBC, A_BORD);
+    for (int i = 1; i < w - 1; i++) { ui_cell(x + i, y, 0xCD, A_BORD); ui_cell(x + i, y + h - 1, 0xCD, A_BORD); }
+    for (int j = 1; j < h - 1; j++) { ui_cell(x, y + j, 0xBA, A_BORD); ui_cell(x + w - 1, y + j, 0xBA, A_BORD); }
+    if (title) ui_text(x + 2, y, title, w - 4, A_TITLE);
+}
+
+/* word-less text wrapping inside a w x h area; returns end position */
+static void ui_wrap(int x, int y, int w, int h, const char *s, uint8_t at, int *ex, int *ey) {
+    int px = 0, py = 0;
+    for (; *s; s++) {
+        if (*s == '\n') { px = 0; py++; continue; }
+        if (px >= w) { px = 0; py++; }
+        if (py >= h) break;
+        ui_cell(x + px, y + py, (uint8_t)*s, at);
+        px++;
+    }
+    if (ex) *ex = px;
+    if (ey) *ey = py;
+}
+
+/* wait for a key; returns 0 after 0.5 s so the clock keeps refreshing */
+static int ui_getkey(void) {
+    uint32_t t0 = ticks;
+    while (kb_head == kb_tail) {
+        __asm__ volatile("hlt");
+        if (ticks - t0 >= 50) return 0;
+    }
+    return (uint8_t)kb_getc();
+}
+
+static int ui_list(int *idx) {
+    int n = 0;
+    for (int i = 0; i < RAMFS_FILE_COUNT; i++) if (ramfs[i].used) idx[n++] = i;
+    return n;
+}
+
+static void ui_kv(int y, const char *key, const char *val) {
+    ui_text(42, y, key, -1, A_DIM);
+    ui_text(50, y, val, 27, A_WIN);
+}
+
+static void ui_draw(const int *idx, int count, int sel, int top, const char *msg) {
+    static char vendor[13];
+    char b[64], t[4];
+    uint32_t secs = ticks / PIT_HZ, files = 0, bytes = 0;
+    if (!vendor[0]) cpu_vendor(vendor);
+    for (int i = 0; i < RAMFS_FILE_COUNT; i++) if (ramfs[i].used) { files++; bytes += (uint32_t)ramfs[i].size; }
+
+    ui_fill(0, 1, VGA_W, VGA_H - 2, 0xB1, A_DESK);
+
+    /* top bar */
+    ui_fill(0, 0, VGA_W, 1, ' ', A_BAR);
+    ui_text(1, 0, "VibeOS", -1, 0x7C);
+    ui_text(9, 0, "Desktop", -1, A_BAR);
+    b[0] = 0; str_cat(b, "Up "); fmt2(t, (secs / 60) % 100); str_cat(b, t); str_cat(b, ":"); fmt2(t, secs % 60); str_cat(b, t);
+    str_cat(b, "   "); str_cat(b, keymap_is_azerty ? "AZERTY" : "QWERTY");
+    ui_text(VGA_W - 1 - (int)strlen(b), 0, b, -1, A_BAR);
+
+    /* files window */
+    ui_box(1, 2, 38, 13, " Files (RAMFS) ");
+    ui_text(3, 3, "Name", -1, A_DIM); ui_text(33, 3, "Size", -1, A_DIM);
+    if (!count) ui_text(3, 5, "No files yet. Press N to add one.", 34, A_WIN);
+    for (int r = 0; r < UI_ROWS; r++) {
+        int i = top + r;
+        if (i >= count) break;
+        struct ramfs_entry *f = &ramfs[idx[i]];
+        uint8_t at = (i == sel) ? A_SEL : A_WIN;
+        ui_fill(2, 4 + r, 36, 1, ' ', at);
+        ui_text(3, 4 + r, f->name, 15, at);
+        b[0] = 0; cat_u(b, (uint32_t)f->size); str_cat(b, " B");
+        ui_text(37 - (int)strlen(b), 4 + r, b, -1, at);
+    }
+
+    /* preview window */
+    ui_box(1, 15, 38, 8, " Preview ");
+    if (count) ui_wrap(3, 16, 34, 6, ramfs[idx[sel]].data, A_WIN, 0, 0);
+    else ui_text(3, 16, "(nothing selected)", -1, A_DIM);
+
+    /* system window */
+    ui_box(40, 2, 39, 10, " System ");
+    b[0] = 0; cat_u(b, secs / 60); str_cat(b, "m "); cat_u(b, secs % 60); str_cat(b, "s");
+    ui_kv(3, "Uptime", b);
+    b[0] = 0; cat_u(b, ticks); ui_kv(4, "Ticks", b);
+    if (mbi && (mbi->flags & 1)) {
+        b[0] = 0; cat_u(b, mbi->mem_upper / 1024); str_cat(b, " MB + "); cat_u(b, mbi->mem_lower); str_cat(b, " KB");
+    } else { b[0] = 0; str_cat(b, "unknown"); }
+    ui_kv(5, "RAM", b);
+    b[0] = 0; cat_u(b, files); str_cat(b, "/"); cat_u(b, RAMFS_FILE_COUNT); str_cat(b, " files");
+    ui_kv(6, "Files", b);
+    b[0] = 0; cat_u(b, bytes); str_cat(b, "/"); cat_u(b, RAMFS_FILE_COUNT * (RAMFS_DATA_CAP - 1)); str_cat(b, " bytes");
+    ui_kv(7, "Used", b);
+    ui_kv(8, "Keymap", keymap_is_azerty ? "AZERTY" : "QWERTY");
+    ui_kv(9, "CPU", vendor);
+
+    /* keys window */
+    ui_box(40, 12, 39, 11, " Keys ");
+    ui_text(42, 13, "\x18 \x19        select a file", -1, A_WIN);
+    ui_text(42, 14, "Enter / E   edit the file", -1, A_WIN);
+    ui_text(42, 15, "N           new file", -1, A_WIN);
+    ui_text(42, 16, "D           delete file", -1, A_WIN);
+    ui_text(42, 17, "K           switch AZERTY/QWERTY", -1, A_WIN);
+    ui_text(42, 18, "Q / Esc     back to the shell", -1, A_WIN);
+    ui_text(42, 20, "In the editor:", -1, A_DIM);
+    ui_text(42, 21, "Tab = save      Esc = cancel", -1, A_WIN);
+
+    /* status bar */
+    ui_fill(0, 24, VGA_W, 1, ' ', A_BAR);
+    if (msg) ui_text(1, 24, msg, 78, A_ERR);
+    else ui_text(1, 24, "Q Quit   N New   Enter Edit   D Delete   K Keymap", 78, A_BAR);
+}
+
+static int ui_input(const char *title, const char *prompt, char *buf, int max) {
+    int n = 0;
+    buf[0] = 0;
+    for (;;) {
+        ui_box(18, 9, 44, 6, title);
+        ui_text(20, 11, prompt, 40, A_WIN);
+        ui_fill(20, 12, 40, 1, ' ', A_SEL);
+        ui_text(20, 12, buf, 38, A_SEL);
+        ui_cell(20 + n, 12, '_', A_SEL);
+        ui_text(20, 13, "Enter = OK    Esc = cancel", 40, A_DIM);
+        int k = ui_getkey();
+        if (!k) continue;
+        if (k == 27) return 0;
+        if (k == '\n') return n > 0;
+        if (k == '\b') { if (n > 0) buf[--n] = 0; }
+        else if (k >= 32 && k < 127 && n < max) { buf[n++] = (char)k; buf[n] = 0; }
+    }
+}
+
+static int ui_confirm(const char *title, const char *line) {
+    int k;
+    ui_box(18, 9, 44, 6, title);
+    ui_text(20, 11, line, 40, A_WIN);
+    ui_text(20, 13, "Y = yes    any other key = no", 40, A_DIM);
+    do { k = ui_getkey(); } while (!k);
+    return k == 'y' || k == 'Y' || k == 'o' || k == 'O';
+}
+
+/* tiny editor: type to append, Backspace deletes, Enter = new line */
+static int ui_edit(struct ramfs_entry *f) {
+    char buf[RAMFS_DATA_CAP], title[32], cnt[16];
+    size_t n = f->size;
+    memcpy(buf, f->data, n);
+    buf[n] = 0;
+    title[0] = 0; str_cat(title, " Edit: "); str_cat(title, f->name); str_cat(title, " ");
+    for (;;) {
+        int ex, ey;
+        ui_box(4, 3, 72, 18, title);
+        ui_wrap(6, 5, 68, 12, buf, A_WIN, &ex, &ey);
+        if (ex >= 68) { ex = 0; ey++; }
+        if (ey < 12) ui_cell(6 + ex, 5 + ey, '_', A_BORD);
+        ui_fill(5, 18, 70, 1, 0xC4, A_BORD);
+        ui_text(6, 19, "Tab = save     Esc = cancel", -1, A_DIM);
+        cnt[0] = 0; cat_u(cnt, (uint32_t)n); str_cat(cnt, "/"); cat_u(cnt, RAMFS_DATA_CAP - 1);
+        ui_text(73 - (int)strlen(cnt), 19, cnt, -1, A_WIN);
+        int k = ui_getkey();
+        if (!k) continue;
+        if (k == 27) return 0;
+        if (k == '\t') { memcpy(f->data, buf, n + 1); f->size = n; return 1; }
+        if (k == '\b') { if (n > 0) buf[--n] = 0; }
+        else if ((k == '\n' || k >= 32) && k != 127 && n < RAMFS_DATA_CAP - 1) { buf[n++] = (char)k; buf[n] = 0; }
+    }
+}
+
+static void ui_run(void) {
+    int idx[RAMFS_FILE_COUNT];
+    int sel = 0, top = 0, count;
+    const char *msg = 0;
+    outb(0x3D4, 0x0A); outb(0x3D5, 0x20);          /* hide the text cursor */
+    for (;;) {
+        count = ui_list(idx);
+        if (sel >= count) sel = count ? count - 1 : 0;
+        if (sel < top) top = sel;
+        if (sel >= top + UI_ROWS) top = sel - UI_ROWS + 1;
+        ui_draw(idx, count, sel, top, msg);
+        msg = 0;
+        int k = ui_getkey();
+        if (!k) continue;
+        if (k >= 'A' && k <= 'Z') k += 32;
+        if (k == 'q' || k == 27) break;
+        else if (k == KEY_UP) { if (sel > 0) sel--; }
+        else if (k == KEY_DOWN) { if (sel < count - 1) sel++; }
+        else if (k == 'k') {
+            set_keymap(!keymap_is_azerty);
+            msg = keymap_is_azerty ? "Keyboard layout: AZERTY" : "Keyboard layout: QWERTY";
+        } else if (k == 'n') {
+            char name[RAMFS_NAME_CAP];
+            if (ui_input(" New file ", "File name:", name, RAMFS_NAME_CAP - 1)) {
+                if (!ramfs_name_valid(name)) msg = "Invalid name (letters, digits, . - _ ; max 15)";
+                else if (ramfs_find(name)) msg = "That file already exists";
+                else {
+                    struct ramfs_entry *f = ramfs_create(name);
+                    if (!f) msg = "RAMFS is full (16 files)";
+                    else {
+                        count = ui_list(idx);
+                        for (int i = 0; i < count; i++) if (&ramfs[idx[i]] == f) sel = i;
+                        if (ui_edit(f)) msg = "File saved";
+                    }
+                }
+            }
+        } else if ((k == '\n' || k == 'e') && count) {
+            if (ui_edit(&ramfs[idx[sel]])) msg = "File saved";
+        } else if (k == 'd' && count) {
+            struct ramfs_entry *f = &ramfs[idx[sel]];
+            char q[40];
+            q[0] = 0; str_cat(q, "Delete "); str_cat(q, f->name); str_cat(q, " ?");
+            if (ui_confirm(" Delete ", q)) { memset(f, 0, sizeof(*f)); msg = "File deleted"; }
+        }
+    }
+    outb(0x3D4, 0x0A); outb(0x3D5, 0x0E);          /* show the cursor again */
+    outb(0x3D4, 0x0B); outb(0x3D5, 0x0F);
+    set_color(15, 0);
+    clear_screen();
+}
+
 static void banner(void) {
     set_color(11, 0);
     puts("  __     ___ _          ___  ____  \n");
@@ -362,14 +653,12 @@ static void banner(void) {
     puts("    \\ V / | | |_) |  __/ |_| |___) |\n");
     puts("     \\_/  |_|_.__/ \\___|\\___/|____/ \n");
     set_color(15, 0);
-    puts("\n  Welcome to VibeOS. Type 'help'.\n\n");
+    puts("\n  Welcome to VibeOS. Type 'help' or 'ui'.\n\n");
 }
 
 static void cmd_cpu(void) {
-    uint32_t b, c, d, dummy;
     char v[13];
-    __asm__ volatile("cpuid" : "=a"(dummy), "=b"(b), "=c"(c), "=d"(d) : "a"(0));
-    memcpy(v, &b, 4); memcpy(v + 4, &d, 4); memcpy(v + 8, &c, 4); v[12] = 0;
+    cpu_vendor(v);
     puts("CPU vendor: "); puts(v); putc('\n');
 }
 
@@ -392,6 +681,7 @@ static void run(char *line) {
              "  color <0-15>    change text color\n"
              "  keymap [azerty|qwerty]\n"
              "  rainbow         colors!\n"
+             "  ui              open the text-mode desktop\n"
              "  ls              list RAM files\n"
              "  touch <name>    create an empty RAM file\n"
              "  write <name> <text>  create or replace file text\n"
@@ -468,8 +758,10 @@ static void run(char *line) {
                 memset(file, 0, sizeof(*file));
             }
         }
+    } else if (!strcmp(line, "ui")) {
+        ui_run();
     } else if (!strcmp(line, "about")) {
-        puts("VibeOS 0.2 - a hobby kernel, vibe-coded.\n32-bit x86, VGA text, PS/2 keyboard, PIT timer, RAM files.\n");
+        puts("VibeOS 0.3 - a hobby kernel, vibe-coded.\n32-bit x86, VGA text, PS/2 keyboard, PIT timer, RAM files, text UI.\n");
     } else if (!strcmp(line, "uptime")) {
         uint32_t s = ticks / PIT_HZ;
         put_dec(s / 60); puts("m "); put_dec(s % 60); puts("s ("); put_dec(ticks); puts(" ticks)\n");
