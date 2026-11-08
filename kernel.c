@@ -251,6 +251,83 @@ void irq_handler(uint32_t vec) {
 }
 
 /* ------------------------------------------------------------------ */
+/* RAM filesystem (in-memory only; contents are lost on reboot)        */
+/* ------------------------------------------------------------------ */
+#define RAMFS_FILE_COUNT 16
+#define RAMFS_NAME_CAP 16
+#define RAMFS_DATA_CAP 192
+
+struct ramfs_entry {
+    int used;
+    char name[RAMFS_NAME_CAP];
+    char data[RAMFS_DATA_CAP];
+    size_t size;
+};
+static struct ramfs_entry ramfs[RAMFS_FILE_COUNT];
+
+static int ramfs_name_valid(const char *name) {
+    size_t n = 0;
+    if (!name || !*name) return 0;
+    for (; name[n]; n++) {
+        unsigned char c = (unsigned char)name[n];
+        if (n >= RAMFS_NAME_CAP - 1) return 0;
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.')) return 0;
+    }
+    return strcmp(name, ".") != 0 && strcmp(name, "..") != 0;
+}
+
+static struct ramfs_entry *ramfs_find(const char *name) {
+    if (!ramfs_name_valid(name)) return 0;
+    for (int i = 0; i < RAMFS_FILE_COUNT; i++)
+        if (ramfs[i].used && !strcmp(ramfs[i].name, name)) return &ramfs[i];
+    return 0;
+}
+
+static struct ramfs_entry *ramfs_create(const char *name) {
+    for (int i = 0; i < RAMFS_FILE_COUNT; i++) {
+        if (!ramfs[i].used) {
+            memset(&ramfs[i], 0, sizeof(ramfs[i]));
+            memcpy(ramfs[i].name, name, strlen(name) + 1);
+            ramfs[i].used = 1;
+            return &ramfs[i];
+        }
+    }
+    return 0;
+}
+
+static void ramfs_ls(void) {
+    int found = 0;
+    for (int i = 0; i < RAMFS_FILE_COUNT; i++) {
+        if (!ramfs[i].used) continue;
+        found = 1;
+        puts(ramfs[i].name);
+        puts("  ");
+        put_dec((uint32_t)ramfs[i].size);
+        puts(" bytes\n");
+    }
+    if (!found) puts("RAMFS is empty. Try: touch <name>\n");
+}
+
+static void ramfs_df(void) {
+    uint32_t files = 0, bytes = 0;
+    for (int i = 0; i < RAMFS_FILE_COUNT; i++) {
+        if (!ramfs[i].used) continue;
+        files++;
+        bytes += (uint32_t)ramfs[i].size;
+    }
+    puts("RAMFS: ");
+    put_dec(files);
+    puts("/");
+    put_dec(RAMFS_FILE_COUNT);
+    puts(" files, ");
+    put_dec(bytes);
+    puts("/");
+    put_dec(RAMFS_FILE_COUNT * (RAMFS_DATA_CAP - 1));
+    puts(" bytes used\n");
+}
+
+/* ------------------------------------------------------------------ */
 /* Shell                                                               */
 /* ------------------------------------------------------------------ */
 struct mb_info { uint32_t flags, mem_lower, mem_upper; };
@@ -315,13 +392,84 @@ static void run(char *line) {
              "  color <0-15>    change text color\n"
              "  keymap [azerty|qwerty]\n"
              "  rainbow         colors!\n"
+             "  ls              list RAM files\n"
+             "  touch <name>    create an empty RAM file\n"
+             "  write <name> <text>  create or replace file text\n"
+             "  cat <name>      print a RAM file\n"
+             "  rm <name>       delete a RAM file\n"
+             "  df              show RAM filesystem usage\n"
              "  reboot | shutdown\n");
     } else if (!strcmp(line, "clear")) {
         clear_screen();
     } else if (!strcmp(line, "echo")) {
         puts(arg); putc('\n');
+    } else if (!strcmp(line, "ls")) {
+        ramfs_ls();
+    } else if (!strcmp(line, "df")) {
+        ramfs_df();
+    } else if (!strcmp(line, "touch")) {
+        if (!ramfs_name_valid(arg)) {
+            puts("usage: touch <name> (letters, digits, dot, dash, underscore; max 15)\n");
+        } else if (ramfs_find(arg)) {
+            puts("File already exists: "); puts(arg); putc('\n');
+        } else {
+            struct ramfs_entry *file = ramfs_create(arg);
+            if (!file) puts("RAMFS is full (16 files).\n");
+            else { puts("Created empty file: "); puts(file->name); putc('\n'); }
+        }
+    } else if (!strcmp(line, "write")) {
+        char *name = arg;
+        char *body = arg;
+        while (*body && *body != ' ') body++;
+        if (!*body) {
+            puts("usage: write <name> <text>\n");
+        } else {
+            *body++ = 0;
+            while (*body == ' ') body++;
+            size_t len = strlen(body);
+            if (!ramfs_name_valid(name)) {
+                puts("Invalid filename (max 15 letters, digits, dot, dash, underscore).\n");
+            } else if (len >= RAMFS_DATA_CAP) {
+                puts("Text is too long (maximum 191 bytes).\n");
+            } else {
+                struct ramfs_entry *file = ramfs_find(name);
+                int created = 0;
+                if (!file) { file = ramfs_create(name); created = 1; }
+                if (!file) {
+                    puts("RAMFS is full (16 files).\n");
+                } else {
+                    memcpy(file->data, body, len + 1);
+                    file->size = len;
+                    puts(created ? "Created and wrote " : "Updated ");
+                    puts(file->name); putc('\n');
+                }
+            }
+        }
+    } else if (!strcmp(line, "cat")) {
+        if (!ramfs_name_valid(arg)) {
+            puts("usage: cat <name>\n");
+        } else {
+            struct ramfs_entry *file = ramfs_find(arg);
+            if (!file) {
+                puts("No such file: "); puts(arg); putc('\n');
+            } else {
+                puts(file->data); putc('\n');
+            }
+        }
+    } else if (!strcmp(line, "rm")) {
+        if (!ramfs_name_valid(arg)) {
+            puts("usage: rm <name>\n");
+        } else {
+            struct ramfs_entry *file = ramfs_find(arg);
+            if (!file) {
+                puts("No such file: "); puts(arg); putc('\n');
+            } else {
+                puts("Deleted "); puts(file->name); putc('\n');
+                memset(file, 0, sizeof(*file));
+            }
+        }
     } else if (!strcmp(line, "about")) {
-        puts("VibeOS 0.1 - a hobby kernel, vibe-coded.\n32-bit x86, VGA text, PS/2 keyboard, PIT timer.\n");
+        puts("VibeOS 0.2 - a hobby kernel, vibe-coded.\n32-bit x86, VGA text, PS/2 keyboard, PIT timer, RAM files.\n");
     } else if (!strcmp(line, "uptime")) {
         uint32_t s = ticks / PIT_HZ;
         put_dec(s / 60); puts("m "); put_dec(s % 60); puts("s ("); put_dec(ticks); puts(" ticks)\n");
@@ -396,7 +544,7 @@ void kmain(uint32_t magic, struct mb_info *info) {
     __asm__ volatile("sti");
 
     banner();
-    char line[128];
+    char line[256];
     for (;;) {
         set_color(10, 0); puts("vibe"); set_color(7, 0); puts("@os"); set_color(15, 0); puts("> ");
         readline(line, sizeof(line));
